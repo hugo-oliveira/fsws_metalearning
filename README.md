@@ -110,7 +110,7 @@ All scripts use the same four positional arguments in either training or testing
 | 3            	| Name of the network model. (Options: unet, efficientlab, deeplabv3, resnet12\|18\|50 )                                                   	|
 | 4            	| Type of loss used in training (Options: sce [Selective Cross Entropy], dice, sce+dice [a combination of both losses], focal [Focal Loss])	|
 
-*An additional optional positional parameter is available only during training of the anil, panet, metaoptnet_ridge, and r2d2. This additional parameter is the path of a pretrained model of a Resnet18 or Resnet50 FCN using SSL. These weights can be downloaded [here](#)*
+*An additional optional positional parameter is available only during training of the anil, panet, metaoptnet_ridge, and r2d2. This additional parameter is the path of a pretrained model of a Resnet18 or Resnet50 FCN using SSL. These weights can be downloaded [here](https://drive.google.com/drive/folders/17Y4khLSwodo1NMdWoU5uLcB__KoHwT2z?usp=sharing)*
 
 ### Available meta-learners
 Gradient-Based:
