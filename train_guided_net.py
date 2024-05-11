@@ -1,0 +1,387 @@
+import os
+import sys
+import copy
+import time
+import random
+import logging
+import numpy as np
+
+import torch
+from torch import nn, optim
+from torch.nn import functional
+from torch.utils import data
+
+from sklearn import metrics
+
+from utils.utils import *
+from utils.experiments import *
+from utils.losses import *
+from models import *
+from data.meta_dataset import *
+
+import learn2learn as l2l
+from learn2learn.data.transforms import (NWays,
+                                         KShots,
+                                         LoadData,
+                                         RemapLabels,
+                                         ConsecutiveLabels)
+
+def one_hot_masks(msk):
+    
+    neg = torch.zeros_like(msk).float()
+    pos = torch.zeros_like(msk).float()
+    
+    neg[msk == 0] = 1
+    pos[msk == 1] = 1
+    
+    neg.unsqueeze_(1)
+    pos.unsqueeze_(1)
+    
+    return neg, pos
+
+def fast_adapt(sup_img,
+               sup_msk,
+               qry_img,
+               qry_msk,
+               model,
+               model_msk,
+               pool,
+               head,
+               loss_name,
+               device):
+    
+    # Adapt the model.
+    weights = loss_weights(sup_msk, device)
+    
+    # Negative and positive encodings of support.
+    sup_neg, sup_pos = one_hot_masks(sup_msk)
+    
+    # Computing query prior embeddings.
+    qry_img_emb = model(qry_img)
+    
+    # Computing support embeddings for image and negative/positive encodings.
+    sup_img_emb = model(sup_img)
+    sup_neg_emb = model_msk(sup_neg)
+    sup_pos_emb = model_msk(sup_pos)
+    
+    sup_cat_emb = (sup_img_emb * sup_neg_emb) * sup_pos_emb
+    
+    sup_cat_emb = pool(sup_cat_emb)
+    sup_cat_emb = torch.mean(sup_cat_emb, dim=0, keepdim=True)
+    
+    # Tiling z on batch and spatial dimensions.
+    sup_emb = torch.tile(sup_cat_emb, (qry_img_emb.shape[0],
+                                       1,
+                                       qry_img_emb.shape[2],
+                                       qry_img_emb.shape[3]))
+    
+    # Computing query posterior embeddings.
+    qry_emb = torch.cat([qry_img_emb, sup_emb], 1)
+    
+    # Predicting for query.
+    qry_prd = head(qry_emb)
+    
+    # Computing supervised loss on query predictions.
+    qry_err = loss_fn(qry_prd, qry_msk, weights, loss_name, device)
+    
+    qry_met = accuracy(qry_msk, qry_prd)
+    
+    return qry_err, qry_met
+
+def main(n_shots=5,             # Number of shots of each task.
+         meta_lr=0.0002,        # LR of the outer loop.
+         inner_iters=4,         # Number of iterations in inner loop.
+         outer_iters=6000,      # Number of iterations in outer loop.
+         seed=42                # Random generator seed.
+        ):
+    
+    # Recovering target dataset and task.
+    assert len(sys.argv) >= 5, 'Not enough input parameters. Exiting...'
+    
+    trg_dataset = sys.argv[1]  # Target dataset for testing.
+    trg_task = sys.argv[2]     # Target task for testing.
+    network_name = sys.argv[3] # Segmentation network architecture.
+    loss_name = sys.argv[4]    # Loss function.
+    
+    # Setting experiment name
+    exp_group_name = 'guided_net_2ch_%s_%s_%s_%s' % (network_name, loss_name, trg_dataset, trg_task)
+    
+    # Setting result directory.
+    result_dir = './experiments/'
+    check_mkdir(result_dir)
+    
+    exp_group_dir = os.path.join(result_dir, exp_group_name)
+    check_mkdir(exp_group_dir)
+    
+    exp_ckpt_dir = os.path.join(result_dir, exp_group_name, 'ckpt')
+    check_mkdir(exp_ckpt_dir)
+    
+    # Setting logging file.
+    log_path = os.path.join(exp_group_dir, 'train_guided_net_2ch.log')
+    logging.basicConfig(filename=log_path, format='%(message)s', level=logging.INFO)
+    
+    # Setting random seeds.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    device = torch.device('cpu')
+    if torch.cuda.device_count():
+        torch.cuda.manual_seed(seed)
+        device = torch.device('cuda:0')
+    
+    # Parameters.
+    root = '../Datasets/'
+    fold = 0
+    normalization = 'minmax'
+#     normalization = 'z-score'
+    resize_to = (140,140)
+    crop_to = (128,128)
+    debug = False
+    verbose = False
+    unet_base = 32
+    
+    batch_size = 3
+    num_workers = 6
+    
+    print_freq = 100
+    test_freq = 6000
+    
+    # Loss selection.
+    if loss_name == 'sce':
+        loss_name = 'SCE'
+    elif loss_name == 'dice':
+        loss_name = 'Dice'
+    elif loss_name == 'sce+dice':
+        loss_name = 'SCE+Dice'
+    elif loss_name == 'focal':
+        loss_name = 'Focal'
+    
+    shots_list = [1, 5, 10, 20]
+#     shots_list = [20, 10, 5, 1]
+    
+    # Setting dataset.
+    meta_set = MetaDataset(root=root,
+                           fold=fold,
+                           trg_dataset=trg_dataset,
+                           resize_to=resize_to,
+                           crop_to=crop_to,
+                           normalization=normalization,
+                           num_shots=n_shots,
+                           debug=debug,
+                           verbose=verbose)
+    
+    # Setting dataloader.
+    meta_loader = data.DataLoader(meta_set,
+                                  batch_size=inner_iters,
+                                  shuffle=True,
+                                  num_workers=num_workers,
+                                  drop_last=True,
+                                  collate_fn=collate_meta)
+    
+    if 'unet' in network_name:
+        
+        # Create model.
+        model = UNet(1, unet_base, 2, final=False)
+        model.to(device)
+        
+        # Create negative and positive mask encoder.
+        model_msk = UNet(1, unet_base, 2, final=False)
+        model_msk.to(device)
+        
+        # Creating average pooler.
+        pool = nn.AdaptiveAvgPool2d((1, 1))
+        pool.to(device)
+        
+        # Create classifier.
+        head = nn.Sequential(nn.Conv2d(unet_base * 16 * 2, unet_base * 2, kernel_size=3, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(unet_base * 2, 2, kernel_size=1))
+        
+        head.to(device)
+    
+    elif 'efficientlab' in network_name:
+        
+        # Create model.
+        model = EfficientLab(1, 2, final=False)
+        model.to(device)
+        
+        # Create negative and positive mask encoder.
+        model_msk = EfficientLab(1, 2, final=False)
+        model_msk.to(device)
+        
+        # Creating average pooler.
+        pool = nn.AdaptiveAvgPool2d((1, 1))
+        pool.to(device)
+        
+        # Create classifier.
+        head = nn.Sequential(nn.Conv2d(model.final_input_channels * 2, model.final_input_channels, kernel_size=3, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(model.final_input_channels, 2, kernel_size=1))
+        
+        head.to(device)
+    
+    elif 'deeplabv3' in network_name:
+        
+        # Create model.
+        model = DeepLabV3(1, 2, final=False)
+        model.to(device)
+        
+        # Create negative and positive mask encoder.
+        model_msk = DeepLabV3(1, 2, final=False)
+        model_msk.to(device)
+        
+        # Creating average pooler.
+        pool = nn.AdaptiveAvgPool2d((1, 1))
+        pool.to(device)
+        
+        # Create classifier.
+        head = nn.Sequential(nn.Conv2d(model.final_input_channels * 2, model.final_input_channels, kernel_size=3, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(model.final_input_channels, 2, kernel_size=1))
+        
+        head.to(device)
+    
+    elif 'resnet12' in network_name:
+        
+        # Create model.
+        model = FCNResNet12(1, 2, final=False)
+        model.to(device)
+        
+        # Create negative and positive mask encoder.
+        model_msk = FCNResNet12(1, 2, final=False)
+        model_msk.to(device)
+        
+        # Creating average pooler.
+        pool = nn.AdaptiveAvgPool2d((1, 1))
+        pool.to(device)
+        
+        # Create classifier.
+        head = nn.Sequential(nn.Conv2d(model.final_input_channels * 2, model.final_input_channels, kernel_size=3, padding=1),
+                            nn.ReLU(),
+                            nn.Conv2d(model.final_input_channels, 2, kernel_size=1))
+        
+        head.to(device)
+        
+    # Setting optimizer and LR scheduler.
+    all_params = list(model.parameters()) + \
+                 list(model_msk.parameters()) + \
+                 list(pool.parameters()) + \
+                 list(head.parameters())
+    opt = optim.Adam(all_params, meta_lr)
+    
+    scheduler = optim.lr_scheduler.StepLR(opt, outer_iters // 3, gamma=0.5)
+    
+    # Lists of error (loss) and metric (jaccard).
+    err_list = []
+    met_list = []
+    
+    # Outer loop.
+    iteration = 1
+    while iteration <= outer_iters:
+        
+        for outer_batch in meta_loader:
+            
+            # Tic.
+            tic = time.time()
+            
+            print('Outer loop %d/%d...' % (iteration, outer_iters))
+            logging.info('Outer loop %d/%d...' % (iteration, outer_iters))
+            sys.stdout.flush()
+            
+            # Initiating counters.
+            meta_qry_err = 0.0
+            meta_qry_met = 0.0
+            
+            # Splitting batch.
+            sup_img, sup_msk, sup_dns, qry_img, qry_msk, sparsity_list, sup_names, qry_names = outer_batch
+            
+            # Inner loop iterations.
+            inner_count = 0
+            for task in range(inner_iters):
+                
+                print('  Inner loop %d/%d, task "%s", mode "%s"...' % (task + 1, inner_iters, sparsity_list[task]['task'], sparsity_list[task]['mode']))
+                logging.info('  Inner loop %d/%d, task "%s", mode "%s"...' % (task + 1, inner_iters, sparsity_list[task]['task'], sparsity_list[task]['mode']))
+                sys.stdout.flush()
+                
+                # Zeroing optimizer gradients.
+                opt.zero_grad()
+                
+                # Obtaining inner loop batch.
+                inner_sup_img = sup_img[task].to(device) # Support images.
+                inner_sup_msk = sup_msk[task].to(device) # Support masks.
+                inner_qry_img = qry_img[task].to(device) # Query images.
+                inner_qry_msk = qry_msk[task].to(device) # Query masks.
+                
+                # Compute meta-training loss.
+                qry_err, qry_met = fast_adapt(inner_sup_img,
+                                              inner_sup_msk,
+                                              inner_qry_img,
+                                              inner_qry_msk,
+                                              model,
+                                              model_msk,
+                                              pool,
+                                              head,
+                                              loss_name,
+                                              device)
+                
+                if not torch.any(torch.isnan(qry_err)):
+                    
+                    # Backpropagating.
+                    qry_err.backward()
+                    
+                    # Taking optimization step.
+                    opt.step()
+                    
+                    # Updating counters.
+                    meta_qry_err += qry_err.item()
+                    meta_qry_met += qry_met
+                    
+                    inner_count += 1
+            
+            # Updating lists.
+            meta_qry_err /= inner_count
+            meta_qry_met /= inner_count
+            
+            err_list.append(meta_qry_err)
+            met_list.append(meta_qry_met)
+            
+            # Print loss and accuracy.
+            print('  Meta Val Err', meta_qry_err)
+            print('  Meta Val Jac', meta_qry_met)
+            logging.info('  Meta Val Err ' + str(meta_qry_err))
+            logging.info('  Meta Val Jac ' + str(meta_qry_met))
+            sys.stdout.flush()
+            
+            # Scheduler step.
+            scheduler.step()
+            
+            # Toc.
+            toc = time.time()
+            print('  Duration %.1f seconds' % (toc - tic))
+            logging.info('  Duration %.1f seconds' % (toc - tic))
+            sys.stdout.flush()
+            
+            # Meta-testing.
+            if iteration % test_freq == 0:
+                
+                # Saving model and optimizer.
+                model_ckpt_path = os.path.join(exp_ckpt_dir, 'model.pth')
+                model_msk_ckpt_path = os.path.join(exp_ckpt_dir, 'model_msk.pth')
+                pool_ckpt_path = os.path.join(exp_ckpt_dir, 'pool.pth')
+                head_ckpt_path = os.path.join(exp_ckpt_dir, 'head.pth')
+                optim_ckpt_path = os.path.join(exp_ckpt_dir, 'optim.pth')
+                
+                torch.save(model, model_ckpt_path)
+                torch.save(model_msk, model_msk_ckpt_path)
+                torch.save(pool, pool_ckpt_path)
+                torch.save(head, head_ckpt_path)
+                torch.save(opt, optim_ckpt_path)
+            
+            # Updating iteration.
+            iteration = iteration + 1
+            
+            if iteration > outer_iters:
+                break
+
+if __name__ == '__main__':
+    main()
